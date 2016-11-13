@@ -1,0 +1,560 @@
+#include "VON_RegEx.h"
+
+#ifdef _DEBUG
+#undef THIS_FILE
+#define new DEBUG_NEW
+#endif
+
+VON_RegEx::VON_RegEx()
+{
+	m_nNextStateID	= 0;
+}
+
+VON_RegEx::~VON_RegEx()
+{
+	// Clean up all allocated memory
+	CleanUp();
+}
+
+bool VON_RegEx::SetRegEx(string strRegEx)
+{
+	// 1. Clean up old regular expression
+	CleanUp();
+    while(strRegEx.find("[0-9]")!=string::npos)
+        strRegEx.replace(strRegEx.find("[0-9]"),5,"(0|1|2|3|4|5|6|7|8|9)");
+    while(strRegEx.find("+")!=string::npos){
+        string s;
+        s+=strRegEx[strRegEx.find("+")-1];
+        strRegEx.replace(strRegEx.find("+"),1,s+"*");
+    }
+    while(strRegEx.find("[a-z]")!=string::npos)
+        strRegEx.replace(strRegEx.find("[a-z]"),5,"(a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)");
+    while(strRegEx.find("[A-Z]")!=string::npos)
+        strRegEx.replace(strRegEx.find("[A-Z]"),5,"(A|B|C|D|E|F|G|H|I|J|K|L|M|N|O|P|Q|R|S|T|U|V|W|X|Y|Z)");
+	// 2. Create NFA
+	if(!CreateNFA(strRegEx))
+		return false;
+	
+	// 3. Convert to DFA
+	ConvertNFAtoDFA();
+
+	// 4. Reduce DFA
+	ReduceDFA();
+
+	return true;
+}
+
+bool VON_RegEx::FindFirst(string strText, int &nPos, string &strPattern)
+{
+	// Clean up all pattern states
+	for(auto iter=m_PatternList.begin(); iter!=m_PatternList.end(); ++iter)
+		delete *iter;
+	m_PatternList.clear();
+
+	// reset the input text
+	m_strText	= strText;
+
+	// Find all patterns
+	if(Find())
+	{
+		nPos			= m_vecPos[0];
+		strPattern		= m_vecPattern[0];
+		m_nPatternIndex	= 0;
+		return true;
+	}
+	return false;
+}
+
+bool VON_RegEx::FindNext(int &nPos, string &strPattern)
+{
+	++m_nPatternIndex;
+	if(m_nPatternIndex<m_vecPos.size())
+	{
+		nPos			= m_vecPos[m_nPatternIndex];
+		strPattern		= m_vecPattern[m_nPatternIndex];
+		return true;
+	}
+	return false;
+}
+
+bool VON_RegEx::Find()
+{
+	// Clean up for new search
+	m_vecPos.clear();
+	m_vecPattern.clear();
+
+	// if there is no DFA then there is no matching
+	if(m_DFATable.empty())
+		return false;
+
+	// Go through all input charactes 
+	for(int i=0; i<m_strText.size(); ++i)
+	{
+		char c = m_strText[i];
+
+		// Check all patterns states
+		for(auto iter=m_PatternList.begin(); iter!=m_PatternList.end(); ++iter)
+		{
+			VON_PatternState *pPatternState = *iter;
+			vector<VON_State*> Transition; // must be at most one because this is DFA
+			pPatternState->m_pState->GetTransition(c, Transition);
+			if(!Transition.empty())
+			{
+				pPatternState->m_pState = Transition[0];
+				if(Transition[0]->m_bAcceptingState)
+				{
+					m_vecPos.push_back(pPatternState->m_nStartIndex);
+					m_vecPattern.push_back(m_strText.substr(pPatternState->m_nStartIndex, 
+						i-pPatternState->m_nStartIndex+1));
+				}
+			}
+			else
+			{
+				// Delete this pattern state
+				iter = m_PatternList.erase(iter);
+				--iter;
+			}
+		}
+
+		// Check it against state 1 of the DFA
+		VON_State *pState = m_DFATable[0];
+		vector<VON_State*> Transition; // must be at most one because this is DFA
+		pState->GetTransition(c, Transition);
+		if(!Transition.empty())
+		{
+			VON_PatternState *pPatternState = new VON_PatternState();
+			pPatternState->m_nStartIndex	= i;
+			pPatternState->m_pState			= Transition[0];
+			m_PatternList.push_back(pPatternState);
+
+			// Check is this accepting state
+			if(Transition[0]->m_bAcceptingState)
+			{
+				m_vecPos.push_back(i);
+				string strTemp;
+				strTemp += c;
+				m_vecPattern.push_back(strTemp);
+			}
+		}
+		else
+		{
+			// Check here is the entry state already accepting
+			// because a* for example would accept 0 or many a's
+			// whcih means that any character is actually accepted
+			if(pState->m_bAcceptingState)
+			{
+				m_vecPos.push_back(i);
+				string strTemp;
+				strTemp += c;
+				m_vecPattern.push_back(strTemp);
+			}
+		}
+	}
+
+	return(m_vecPos.size()>0);
+}
+
+bool VON_RegEx::Eval()
+{
+	// First pop the operator from the stack
+	if(m_OperatorStack.size()>0)
+	{
+		char chOperator = m_OperatorStack.top();
+		m_OperatorStack.pop();
+
+		// Check which operator it is
+		switch(chOperator)
+		{
+		case  42:
+			return Star();
+			break;
+		case 124:
+			return Union();
+			break;
+		case   8:
+			return Concat();
+			break;
+		}
+
+		return false;
+	}
+
+	return false;
+}
+
+bool VON_RegEx::Concat()
+{
+	// Pop 2 elements
+	FSA_TABLE A, B;
+	if(!Pop(B) || !Pop(A))
+		return false;
+
+	// Now evaluate AB
+	// Basically take the last state from A
+	// and add an epsilon transition to the
+	// first state of B. Store the result into
+	// new NFA_TABLE and push it onto the stack
+	A[A.size()-1]->AddTransition(0, B[0]);
+	A.insert(A.end(), B.begin(), B.end());
+
+	// Push the result onto the stack
+	m_OperandStack.push(A);
+
+	return true;
+}
+
+bool VON_RegEx::Star()
+{
+	// Pop 1 element
+	FSA_TABLE A, B;
+	if(!Pop(A))
+		return false;
+
+	// Now evaluate A*
+	// Create 2 new states which will be inserted 
+	// at each end of deque. Also take A and make 
+	// a epsilon transition from last to the first 
+	// state in the queue. Add epsilon transition 
+	// between two new states so that the one inserted 
+	// at the begin will be the source and the one
+	// inserted at the end will be the destination
+	VON_State *pStartState	= new VON_State(++m_nNextStateID);
+	VON_State *pEndState	= new VON_State(++m_nNextStateID);
+	pStartState->AddTransition(0, pEndState);
+
+	// add epsilon transition from start state to the first state of A
+	pStartState->AddTransition(0, A[0]);
+
+	// add epsilon transition from A last state to end state
+	A[A.size()-1]->AddTransition(0, pEndState);
+
+	// From A last to A first state
+	A[A.size()-1]->AddTransition(0, A[0]);
+
+	// construct new DFA and store it onto the stack
+	A.push_back(pEndState);
+	A.push_front(pStartState);
+
+	// Push the result onto the stack
+	m_OperandStack.push(A);
+
+	return true;
+}
+
+bool VON_RegEx::Union()
+{
+	// Pop 2 elements
+	FSA_TABLE A, B;
+	if(!Pop(B) || !Pop(A))
+		return false;
+
+	// Now evaluate A|B
+	// Create 2 new states, a start state and
+	// a end state. Create epsilon transition from
+	// start state to the start states of A and B
+	// Create epsilon transition from the end 
+	// states of A and B to the new end state
+	VON_State *pStartState	= new VON_State(++m_nNextStateID);
+	VON_State *pEndState	= new VON_State(++m_nNextStateID);
+	pStartState->AddTransition(0, A[0]);
+	pStartState->AddTransition(0, B[0]);
+	A[A.size()-1]->AddTransition(0, pEndState);
+	B[B.size()-1]->AddTransition(0, pEndState);
+
+	// Create new NFA from A
+	B.push_back(pEndState);
+	A.push_front(pStartState);
+	A.insert(A.end(), B.begin(), B.end());
+
+	// Push the result onto the stack
+	m_OperandStack.push(A);
+
+	return true;
+}
+
+void VON_RegEx::show()
+{
+    for(auto i:m_vecPattern){
+        cout<<i<<endl;
+    }
+}
+string VON_RegEx::ConcatExpand(string strRegEx)
+{
+	string strRes;
+
+	for(int i=0; i<strRegEx.size()-1; ++i)
+	{
+		char cLeft	= strRegEx[i];
+		char cRight = strRegEx[i+1];
+		strRes	   += cLeft;
+		if((IsInput(cLeft)) || (IsRightParanthesis(cLeft)) || (cLeft == '*'))
+			if((IsInput(cRight)) || (IsLeftParanthesis(cRight)))
+				strRes += char(8);
+	}
+	strRes += strRegEx[strRegEx.size()-1];
+
+	return strRes;
+}
+
+bool VON_RegEx::CreateNFA(string strRegEx)
+{
+	/* Parse regular expresion using similar 
+	 method to evaluate arithmetic expressions
+	 But first we will detect concatenation and
+	 insert char(8) at the position where 
+	 concatenation needs to occur
+	*/
+	strRegEx = ConcatExpand(strRegEx);
+
+	for(int i=0; i<strRegEx.size(); ++i)
+	{
+		// get the charcter
+		char c = strRegEx[i];
+		
+		if(IsInput(c))
+			Push(c);
+		else if(m_OperatorStack.empty())
+			m_OperatorStack.push(c);
+		else if(IsLeftParanthesis(c))
+			m_OperatorStack.push(c);
+		else if(IsRightParanthesis(c))
+		{
+			// Evaluate everyting in paranthesis
+			while(!IsLeftParanthesis(m_OperatorStack.top()))
+				if(!Eval())
+					return false;
+			// Remove left paranthesis after the evaluation
+			m_OperatorStack.pop(); 
+		}
+		else
+		{
+			while(!m_OperatorStack.empty() && Presedence(c, m_OperatorStack.top()))
+				if(!Eval())
+					return false;
+			m_OperatorStack.push(c);
+		}
+	}
+
+	// Evaluate the rest of operators
+	while(!m_OperatorStack.empty())
+		if(!Eval())
+			return false;
+
+	// Pop the result from the stack
+	if(!Pop(m_NFATable))
+		return false;
+
+	// Last NFA state is always accepting state
+	m_NFATable[m_NFATable.size()-1]->m_bAcceptingState = true;
+
+	return true;
+}
+
+void VON_RegEx::Push(char chInput)
+{
+	// Create 2 new states on the heap
+	VON_State *s0 = new VON_State(++m_nNextStateID);
+	VON_State *s1 = new VON_State(++m_nNextStateID);
+
+	// Add the transition from s0->s1 on input character
+	s0->AddTransition(chInput, s1);
+
+	// Create a NFA from these 2 states 
+	FSA_TABLE NFATable;
+	NFATable.push_back(s0);
+	NFATable.push_back(s1);
+
+	// push it onto the operand stack
+	m_OperandStack.push(NFATable);
+
+	// Add this character to the input character set
+	m_InputSet.insert(chInput);
+
+}
+
+bool VON_RegEx::Pop(FSA_TABLE &NFATable)
+{
+	// If the stack is empty we cannot pop anything
+	if(m_OperandStack.size()>0)
+	{
+		NFATable = m_OperandStack.top();
+		m_OperandStack.pop();
+		return true;
+	}
+
+	return false;
+}
+
+void VON_RegEx::EpsilonClosure(set<VON_State*> T, set<VON_State*> &Res)
+{
+	Res.clear();
+	
+	// Initialize result with T because each state
+	// has epsilon closure to itself
+	Res = T;
+
+	// Push all states onto the stack
+	stack<VON_State*> unprocessedStack;
+	for(auto iter=T.begin(); iter!=T.end(); ++iter)
+		unprocessedStack.push(*iter);
+
+	// While the unprocessed stack is not empty
+	while(!unprocessedStack.empty())
+	{
+		// Pop t, the top element from unprocessed stack
+		VON_State* t = unprocessedStack.top();
+		unprocessedStack.pop();
+
+		// Get all epsilon transition for this state
+		vector<VON_State*> epsilonStates;
+		t->GetTransition(0, epsilonStates);
+
+		// For each state u with an edge from t to u labeled epsilon
+		for(int i=0; i<epsilonStates.size(); ++i)
+		{
+			VON_State* u = epsilonStates[i];
+			// if u not in e-closure(T)
+			if(Res.find(u) == Res.end())
+			{
+				Res.insert(u);
+				unprocessedStack.push(u);
+			}
+		}
+	}
+}
+
+void VON_RegEx::Move(char chInput, set<VON_State*> T, set<VON_State*> &Res)
+{
+	Res.clear();
+
+	/* This is very simple since I designed the NFA table
+	   structure in a way that we just need to loop through
+	   each state in T and recieve the transition on chInput.
+	   Then we will put all the results into the set, which
+	   will eliminate duplicates automatically for us.
+	*/
+	for(auto iter=T.begin(); iter!=T.end(); ++iter)
+	{
+		// Get all transition states from this specific
+		// state to other states
+		VON_State* pState = *iter;
+		vector<VON_State*> States;
+		pState->GetTransition(chInput, States);
+
+		// Now add these all states to the result
+		// This will eliminate duplicates
+		for(int i=0; i<States.size(); ++i)
+			Res.insert(States[i]);
+	}
+}
+
+void VON_RegEx::ConvertNFAtoDFA()
+{
+	// Clean up the DFA Table first
+	for(int i=0; i<m_DFATable.size(); ++i)
+		delete m_DFATable[i];
+	m_DFATable.clear();
+
+	// Check is NFA table empty
+	if(m_NFATable.size() == 0)
+		return;
+
+	// Reset the state id for new naming
+	m_nNextStateID = 0;
+
+	// Array of unprocessed DFA states
+	vector<VON_State*> unmarkedStates;
+
+	// Starting state of DFA is epsilon closure of 
+	// starting state of NFA state (set of states)
+	set<VON_State*> DFAStartStateSet;
+	set<VON_State*> NFAStartStateSet;
+	NFAStartStateSet.insert(m_NFATable[0]);
+	EpsilonClosure(NFAStartStateSet, DFAStartStateSet);
+
+	// Create new DFA State (start state) from the NFA states
+	VON_State *DFAStartState = new VON_State(DFAStartStateSet, ++m_nNextStateID);
+
+	// Add the start state to the DFA
+	m_DFATable.push_back(DFAStartState);
+
+	// Add the starting state to set of unprocessed DFA states
+	unmarkedStates.push_back(DFAStartState);
+	while(!unmarkedStates.empty())
+	{
+		// process an unprocessed state
+		VON_State* processingDFAState = unmarkedStates[unmarkedStates.size()-1];
+		unmarkedStates.pop_back();
+
+		// for each input signal a
+		for(auto iter=m_InputSet.begin(); iter!=m_InputSet.end(); ++iter)
+		{
+			set<VON_State*> MoveRes, EpsilonClosureRes;
+			Move(*iter, processingDFAState->GetNFAState(), MoveRes);
+			EpsilonClosure(MoveRes, EpsilonClosureRes);
+
+			// Check is the resulting set (EpsilonClosureSet) in the
+			// set of DFA states (is any DFA state already constructed
+			// from this set of NFA states) or in pseudocode:
+			// is U in D-States already (U = EpsilonClosureSet)
+			bool bFound		= false;
+			VON_State *s	= NULL;
+			for(int i=0; i<m_DFATable.size(); ++i)
+			{
+				s = m_DFATable[i];
+				if(s->GetNFAState() == EpsilonClosureRes)
+				{
+					bFound = true;
+					break;
+				}
+			}
+			if(!bFound)
+			{
+				VON_State* U = new VON_State(EpsilonClosureRes, ++m_nNextStateID);
+				unmarkedStates.push_back(U);
+				m_DFATable.push_back(U);
+				
+				// Add transition from processingDFAState to new state on the current character
+				processingDFAState->AddTransition(*iter, U);
+			}
+			else
+			{
+				// This state already exists so add transition from 
+				// processingState to already processed state
+				processingDFAState->AddTransition(*iter, s);
+			}
+		}
+	}
+}
+
+void VON_RegEx::ReduceDFA()
+{
+	// Get the set of all dead end states in DFA
+	set<VON_State*> DeadEndSet;
+	for(int i=0; i<m_DFATable.size(); ++i)
+		if(m_DFATable[i]->IsDeadEnd())
+			DeadEndSet.insert(m_DFATable[i]);
+
+	// If there are no dead ends then there is nothing to reduce
+	if(DeadEndSet.empty())
+		return;
+
+	// Remove all transitions to these states
+	for(auto iter=DeadEndSet.begin(); iter!=DeadEndSet.end(); ++iter)
+	{
+		// Remove all transitions to this state
+		for(int i=0; i<m_DFATable.size(); ++i)
+			m_DFATable[i]->RemoveTransition(*iter);
+
+		// Remove this state from the DFA Table
+		deque<VON_State*>::iterator pos;
+		for(pos=m_DFATable.begin(); pos!=m_DFATable.end(); ++pos)
+			if(*pos == *iter)
+				break;
+		// Erase element from the table
+		m_DFATable.erase(pos);
+
+		// Now free the memory used by the element
+		delete *iter;
+	}
+}
